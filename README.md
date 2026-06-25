@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🔱 HydraPrime (Aurum Edition)
+# 🔱 HydraPrime
 
 ![MQL5](https://img.shields.io/badge/MQL5-Expert_Advisor-blue)
 ![MetaTrader5](https://img.shields.io/badge/Platform-MT5-green)
