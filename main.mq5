@@ -1,18 +1,18 @@
 //+------------------------------------------------------------------+
 //|                                           HydraPrime_Gold_v1.mq5 |
-//|                     HYDRA PRIME: AURUM EDITION                   |
+//|                        HYDRA PRIME                   |
 //|       Specialized Logic for XAUUSD (Liquidity & Deep Structure)  |
 //+------------------------------------------------------------------+
 #property copyright "Hydra Prime Architecture"
 #property link      "Internal"
-#property version   "1.01 Gold" // Version Bump
+#property version   "1.01 Gold"
 #property strict
 #property tester_indicator "ATR"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
 #include <Trade\AccountInfo.mqh>
-#include <Trade\OrderInfo.mqh> // Added for robust order selection
+#include <Trade\OrderInfo.mqh>
 
 //+------------------------------------------------------------------+
 //| ENUMERATIONS                                                     |
@@ -24,7 +24,7 @@ enum ENUM_TRAIL_MODE {
 };
 
 //+------------------------------------------------------------------+
-//| INPUT PARAMETERS (TUNED FOR GOLD M5)                             |
+//| INPUT PARAMETERS (FULLY MASKED RETAIL DEFAULTS)                   |
 //+------------------------------------------------------------------+
 input group "=== 1. Gold Setup ==="
 input string    InpSymbol1        = "XAUUSD";
@@ -41,29 +41,29 @@ input bool      InpTrade_Friday      = false; // Gold often chops on late Friday
 
 input group "=== 3. Deep Structure (Liquidity) ==="
 input ENUM_TIMEFRAMES InpTF       = PERIOD_M5;
-input double    InpBaseSwing_Dev  = 2.0;           // STIFF deviation to ignore noise
+input double    InpBaseSwing_Dev  = 1.5;           // Masked: Standard baseline deviation
 input int       InpVol_Period     = 14;            // Standard ATR
-input double    InpOTE_Shallow    = 0.705;         // Entry Start (Deeper than 0.618)
-input double    InpOTE_Deep       = 0.886;         // Entry End (The "Sweet Spot")
-input int       InpCancel_Bars    = 12;            // Give Gold more time to return
+input double    InpOTE_Shallow    = 0.618;         // Masked: Standard Fibonacci
+input double    InpOTE_Deep       = 0.786;         // Masked: Standard Fibonacci
+input int       InpCancel_Bars    = 8;             // Expiration bars threshold
 
 input group "=== 4. Protection & Wick Logic ==="
-input double    InpSL_ATR_Mult    = 2.5;           // Wide stop to survive volatility
-input double    InpLiquidity_Pad  = 200;           // Points (approx $2.00) extra padding below Low
-input double    InpMin_Stop_Dist  = 100;           // Points (Allow $1.00 min stop distance)
-input double    InpTP_Risk_Reward = 4.0;           // Target 4R (Realistic for Gold runs)
+input double    InpSL_ATR_Mult    = 2.0;           // Masked: Standard ATR multiplier
+input double    InpLiquidity_Pad  = 100;           // Masked: Standard $1.00 liquidity cushion
+input double    InpMin_Stop_Dist  = 100;           // Points Minimum stop distance
+input double    InpTP_Risk_Reward = 2.0;           // Masked: Standard 1:2 Risk/Reward target
 
 input group "=== 5. Management ==="
 input ENUM_TRAIL_MODE InpTrailMode = TRAIL_VOLATILITY; 
-input double          InpTrail_ATR = 3.5;          // Loose trailing (Gold breathes deep)
+input double          InpTrail_ATR = 2.0;          // Masked: Standard tight trailing stop
 input bool            InpUse_Partial = true;       // Secure the bag early on Gold
-input double          InpSpread_Max  = 400;        // Max Spread in Points ($0.40)
+input double          InpSpread_Max  = 300;        // Max Spread in Points ($0.30)
 
 // --- Global Objects ---
 CTrade          trade;
 CPositionInfo   posInfo;
 CAccountInfo    accInfo;
-COrderInfo      orderInfo; // Added object
+COrderInfo      orderInfo;
 
 // --- Structures ---
 struct CSwingNode {
@@ -92,7 +92,6 @@ CState          State;
 double          dailyStartEquity;
 datetime        lastDayCheck;
 int             handle_ATR;
-ulong           PartialedTickets[]; // Memory for partial closes
 
 // Forward Declarations
 double GetATR(int idx);
@@ -106,7 +105,7 @@ bool   SpreadOk(string sym);
 void   CheckDailyDrawdown();
 void   SetRobustFillingMode(string sym);
 
-// Partial Memory Helpers
+// Persistent Memory Helpers (MQL5 Global Variables)
 bool   IsPartialled(ulong ticket);
 void   MarkPartialled(ulong ticket);
 
@@ -130,14 +129,32 @@ int OnInit() {
    State.lastCalcBar = 0;
    State.count = 0;
    State.LastTradedLegTime = 0;
-   ArrayResize(PartialedTickets, 0); // Reset memory on init
+
+   // --- HOUSEKEEPING: Clean up global variables for closed tickets on boot ---
+   for(int i = GlobalVariablesTotal() - 1; i >= 0; i--) {
+      string gv_name = GlobalVariableName(i);
+      if(StringFind(gv_name, "Hydra_Partial_") == 0) {
+         string ticket_str = StringSubstr(gv_name, 14);
+         ulong ticket = StringToInteger(ticket_str);
+         
+         bool position_active = false;
+         for(int j = PositionsTotal() - 1; j >= 0; j--) {
+            if(posInfo.SelectByIndex(j) && posInfo.Ticket() == ticket) {
+               position_active = true;
+               break;
+            }
+         }
+         if(!position_active) {
+            GlobalVariableDel(gv_name);
+         }
+      }
+   }
 
    return(INIT_SUCCEEDED);
 }
 
 void OnDeinit(const int reason) {
    IndicatorRelease(handle_ATR);
-   ArrayFree(PartialedTickets);
 }
 
 //+------------------------------------------------------------------+
@@ -155,7 +172,7 @@ void OnTick() {
    string sym = InpSymbol1;
    if(sym == "") return;
 
-   // 1. Manage existing trades (Updated)
+   // 1. Manage existing trades
    ManageLifecycle(sym);
    
    // 2. Scan structure on new bar
@@ -170,12 +187,11 @@ void OnTick() {
 }
 
 //+------------------------------------------------------------------+
-//| LOGIC: EXECUTION & MANAGEMENT (UPDATED)                          |
+//| LOGIC: EXECUTION & MANAGEMENT                                    |
 //+------------------------------------------------------------------+
 void ManageLifecycle(string sym) {
-   // A. Clean Pending Orders (FIXED SELECTION LOGIC)
+   // A. Clean Pending Orders (Race-Safe Execution Selection)
    for(int i = OrdersTotal() - 1; i >= 0; i--) {
-      // Use COrderInfo for robust selection
       if(orderInfo.SelectByIndex(i)) {
          if(orderInfo.Symbol() == sym && orderInfo.Magic() == InpMagicNum) {
             datetime setupTime = (datetime)orderInfo.TimeSetup();
@@ -189,7 +205,7 @@ void ManageLifecycle(string sym) {
       }
    }
 
-   // B. Manage Positions (ADDED PARTIAL MEMORY)
+   // B. Manage Positions (With Persistent Global Variables)
    for(int i = PositionsTotal() - 1; i >= 0; i--) {
       if(!posInfo.SelectByIndex(i)) continue;
       if(posInfo.Symbol() != sym || posInfo.Magic() != InpMagicNum) continue;
@@ -208,31 +224,26 @@ void ManageLifecycle(string sym) {
       double profit_points = (type == POSITION_TYPE_BUY) ? (curr - open) : (open - curr);
       double r_current = profit_points / r_dist;
 
-      // 1. Partial Close with Memory Check
+      // 1. Partial Close with Persistent Global Memory
       if(InpUse_Partial && r_current >= 2.0) {
-         // Check Memory: Have we already partialled this specific ticket?
          if(!IsPartialled(ticket)) {
             double minVol = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
             double step   = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
             
-            // Ensure we have enough volume to split (at least 2x min)
             if(vol >= minVol * 2.0) { 
                double partVol = MathFloor((vol * 0.5) / step) * step;
                if(partVol >= minVol) {
                   if(trade.PositionClosePartial(ticket, partVol)) {
-                     MarkPartialled(ticket); // Remember this action
+                     MarkPartialled(ticket); 
                      
                      // Move SL to Breakeven + Buffer
                      double buffer = 50 * SymbolInfoDouble(sym, SYMBOL_POINT); 
                      double be = (type == POSITION_TYPE_BUY) ? (open + buffer) : (open - buffer);
                      trade.PositionModify(ticket, be, tp);
-                     
-                     // Refresh position info after modification before continuing
                      continue; 
                   }
                }
             } else {
-               // Volume too small to partial, mark as processed to stop checking
                MarkPartialled(ticket); 
             }
          }
@@ -259,25 +270,21 @@ void ManageLifecycle(string sym) {
 }
 
 //+------------------------------------------------------------------+
-//| PARTIAL MEMORY FUNCTIONS                                         |
+//| PERSISTENT TRADE STATE RECOVERY FUNCTIONS                        |
 //+------------------------------------------------------------------+
 bool IsPartialled(ulong ticket) {
-   int size = ArraySize(PartialedTickets);
-   for(int i=0; i<size; i++) {
-      if(PartialedTickets[i] == ticket) return true;
-   }
-   return false;
+   string gv_name = "Hydra_Partial_" + IntegerToString(ticket);
+   return GlobalVariableExist(gv_name);
 }
 
 void MarkPartialled(ulong ticket) {
    if(IsPartialled(ticket)) return;
-   int size = ArraySize(PartialedTickets);
-   ArrayResize(PartialedTickets, size + 1);
-   PartialedTickets[size] = ticket;
+   string gv_name = "Hydra_Partial_" + IntegerToString(ticket);
+   GlobalVariableSet(gv_name, 1.0);
 }
 
 //+------------------------------------------------------------------+
-//| ZIGZAG & STRUCTURE LOGIC                                         |
+//| ZIGZAG & STRUCTURE LOGIC (SYNCHRONIZED DATA STREAMING)           |
 //+------------------------------------------------------------------+
 void UpdateZigZag(string sym) {
    double atr = GetATR(0);
@@ -285,8 +292,13 @@ void UpdateZigZag(string sym) {
 
    double dev = InpBaseSwing_Dev * atr;
    
-   double high = iHigh(sym, InpTF, 1);
-   double low  = iLow(sym, InpTF, 1);
+   // Safe, Synchronized Data Grab to prevent stale VPS values
+   double high_arr[], low_arr[];
+   if(CopyHigh(sym, InpTF, 1, 1, high_arr) <= 0 || CopyLow(sym, InpTF, 1, 1, low_arr) <= 0) {
+      return; 
+   }
+   double high = high_arr[0];
+   double low  = low_arr[0];
    datetime time = iTime(sym, InpTF, 1);
 
    if(State.dir == 0) {
@@ -394,6 +406,12 @@ CFVG ScanLegForFVG(string sym, datetime tStart, datetime tEnd, bool bullish, dou
    
    int idxA = iBarShift(sym, InpTF, tStart);
    int idxB = iBarShift(sym, InpTF, tEnd);
+   
+   // Safety Guard to prevent out-of-bounds crashes
+   if(idxA < 0 || idxB < 0) {
+      return best;
+   }
+   
    int startIdx = MathMax(idxA, idxB);
    int endIdx   = MathMin(idxA, idxB);
    int total    = iBars(sym, InpTF);
@@ -470,16 +488,27 @@ bool SpreadOk(string sym) {
    return true;
 }
 
+//+------------------------------------------------------------------+
+//| ASYNCHRONOUS SECURE LIQUIDATION CIRCUIT BREAKER                  |
+//+------------------------------------------------------------------+
 void CheckDailyDrawdown() {
    double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
    double dropPercent = (dailyStartEquity - currentEquity) / dailyStartEquity * 100.0;
    
    if(dropPercent >= InpMaxDailyLoss) {
-      for(int i=PositionsTotal()-1; i>=0; i--) {
-         if(posInfo.SelectByIndex(i)) trade.PositionClose(posInfo.Ticket());
+      // Safely close all positions sequentially using index 0 to avoid async drift
+      while(PositionsTotal() > 0) {
+         if(posInfo.SelectByIndex(0)) {
+            trade.PositionClose(posInfo.Ticket());
+            Sleep(100); 
+         }
       }
-      for(int i=OrdersTotal()-1; i>=0; i--) {
-         if(orderInfo.SelectByIndex(i)) trade.OrderDelete(orderInfo.Ticket());
+      // Safely delete all open pending orders sequentially using index 0
+      while(OrdersTotal() > 0) {
+         if(orderInfo.SelectByIndex(0)) {
+            trade.OrderDelete(orderInfo.Ticket());
+            Sleep(100);
+         }
       }
    }
 }
