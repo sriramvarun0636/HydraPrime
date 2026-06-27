@@ -11,7 +11,7 @@
 
 ---
 
-> **HydraPrime (Aurum Edition)** is an **autonomous, object-oriented, systematic trading Expert Advisor (EA)** designed for the highly liquid Gold (XAUUSD) spot market on MetaTrader 5.
+> **HydraPrime** is an **autonomous, object-oriented, systematic trading Expert Advisor (EA)** designed for the highly liquid Gold (XAUUSD) spot market on MetaTrader 5.
 > Built entirely in MQL5, it integrates **volatility-adaptive swing structures**, **Optimal Trade Entry (OTE)** math, and **Fair Value Gap (FVG) snipers** to execute precise systematic retest setups.
 >
 > HydraPrime complements [SentinelPrime](https://github.com/sriramvarun0636/SentinelPrime), a Python-based event-driven trading engine focused on execution infrastructure. While SentinelPrime emphasizes distributed market data processing, HydraPrime focuses on systematic strategy execution within the MetaTrader 5 ecosystem.
